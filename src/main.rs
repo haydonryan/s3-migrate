@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use aws_config::BehaviorVersion;
+use aws_sdk_s3::types::CompletedMultipartUpload;
+use aws_sdk_s3::types::CompletedPart;
 use aws_sdk_s3::{config::Region, primitives::ByteStream, Client};
 use clap::{Parser, Subcommand};
 use futures::stream::{self, StreamExt};
@@ -8,8 +10,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 use walkdir::WalkDir;
+
+// Multipart upload thresholds
+const MULTIPART_THRESHOLD: u64 = 5 * 1024 * 1024 * 1024; // 5GB - use multipart for files larger than this
+const MULTIPART_PART_SIZE: u64 = 100 * 1024 * 1024; // 100MB per part
 
 #[derive(Parser)]
 #[command(name = "s3-migrate")]
@@ -664,17 +671,15 @@ async fn upload_file(
         eprintln!("[verbose] File size: {} ({})", file_size, format_bytes(file_size));
     }
 
-    // Warn about large files
-    const MAX_SINGLE_UPLOAD: u64 = 5 * 1024 * 1024 * 1024; // 5GB
-    if file_size > MAX_SINGLE_UPLOAD {
-        return Err(UploadError {
-            file_path: file_path.to_path_buf(),
-            key: key.clone(),
-            reason: format!("File too large for single upload ({} > 5GB)", format_bytes(file_size)),
-            details: Some("Consider using multipart upload for files larger than 5GB".to_string()),
-        });
+    // Use multipart upload for large files
+    if file_size > MULTIPART_THRESHOLD {
+        if verbose {
+            eprintln!("[verbose] Using multipart upload for large file ({})", format_bytes(file_size));
+        }
+        return upload_multipart(client, file_path, bucket, &key, file_size, verbose).await;
     }
 
+    // Single part upload for smaller files
     let body = match ByteStream::from_path(file_path).await {
         Ok(b) => b,
         Err(e) => {
@@ -708,6 +713,243 @@ async fn upload_file(
                 file_path: file_path.to_path_buf(),
                 key,
                 reason,
+                details: Some(format!("{:?}", service_err)),
+            })
+        }
+    }
+}
+
+async fn upload_multipart(
+    client: &Client,
+    file_path: &Path,
+    bucket: &str,
+    key: &str,
+    file_size: u64,
+    verbose: bool,
+) -> Result<(), UploadError> {
+    // Create multipart upload
+    let create_response = match client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let service_err = e.into_service_error();
+            return Err(UploadError {
+                file_path: file_path.to_path_buf(),
+                key: key.to_string(),
+                reason: format!("Failed to create multipart upload: {}", format_s3_error(&service_err)),
+                details: Some(format!("{:?}", service_err)),
+            });
+        }
+    };
+
+    let upload_id = create_response.upload_id().ok_or_else(|| UploadError {
+        file_path: file_path.to_path_buf(),
+        key: key.to_string(),
+        reason: "No upload ID returned from create_multipart_upload".to_string(),
+        details: None,
+    })?;
+
+    if verbose {
+        eprintln!("[verbose] Created multipart upload with ID: {}", upload_id);
+    }
+
+    // Calculate parts
+    let num_parts = (file_size + MULTIPART_PART_SIZE - 1) / MULTIPART_PART_SIZE;
+    if verbose {
+        eprintln!("[verbose] Uploading in {} parts of {} each", num_parts, format_bytes(MULTIPART_PART_SIZE));
+    }
+
+    // Upload parts
+    let completed_parts: Arc<Mutex<Vec<CompletedPart>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut part_uploads = Vec::new();
+
+    for part_number in 1..=num_parts {
+        let start = (part_number - 1) * MULTIPART_PART_SIZE;
+        let end = std::cmp::min(start + MULTIPART_PART_SIZE, file_size);
+        let part_size = end - start;
+
+        let client = client.clone();
+        let bucket = bucket.to_string();
+        let key = key.to_string();
+        let upload_id = upload_id.to_string();
+        let file_path = file_path.to_path_buf();
+        let completed_parts = completed_parts.clone();
+
+        part_uploads.push(async move {
+            upload_part(
+                &client,
+                &file_path,
+                &bucket,
+                &key,
+                &upload_id,
+                part_number as i32,
+                start,
+                part_size,
+                completed_parts,
+                verbose,
+            )
+            .await
+        });
+    }
+
+    // Execute part uploads with limited concurrency (4 concurrent parts)
+    let results: Vec<Result<(), UploadError>> = stream::iter(part_uploads)
+        .buffer_unordered(4)
+        .collect()
+        .await;
+
+    // Check for errors
+    let errors: Vec<_> = results.into_iter().filter_map(|r| r.err()).collect();
+    if !errors.is_empty() {
+        // Abort the multipart upload
+        if verbose {
+            eprintln!("[verbose] Aborting multipart upload due to errors");
+        }
+        let _ = client
+            .abort_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await;
+
+        return Err(UploadError {
+            file_path: file_path.to_path_buf(),
+            key: key.to_string(),
+            reason: format!("Multipart upload failed: {} part(s) failed", errors.len()),
+            details: Some(errors.iter().map(|e| e.reason.clone()).collect::<Vec<_>>().join("; ")),
+        });
+    }
+
+    // Complete the multipart upload
+    let mut parts = completed_parts.lock().await;
+    parts.sort_by_key(|p| p.part_number());
+
+    let completed_upload = CompletedMultipartUpload::builder()
+        .set_parts(Some(parts.clone()))
+        .build();
+
+    match client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(completed_upload)
+        .send()
+        .await
+    {
+        Ok(_) => {
+            if verbose {
+                eprintln!("[verbose] Completed multipart upload: {}", key);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let service_err = e.into_service_error();
+            Err(UploadError {
+                file_path: file_path.to_path_buf(),
+                key: key.to_string(),
+                reason: format!("Failed to complete multipart upload: {}", format_s3_error(&service_err)),
+                details: Some(format!("{:?}", service_err)),
+            })
+        }
+    }
+}
+
+async fn upload_part(
+    client: &Client,
+    file_path: &Path,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i32,
+    start: u64,
+    part_size: u64,
+    completed_parts: Arc<Mutex<Vec<CompletedPart>>>,
+    verbose: bool,
+) -> Result<(), UploadError> {
+    if verbose {
+        eprintln!(
+            "[verbose] Uploading part {} (offset: {}, size: {})",
+            part_number,
+            format_bytes(start),
+            format_bytes(part_size)
+        );
+    }
+
+    // Read the part from file
+    let mut file = match fs::File::open(file_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            return Err(UploadError {
+                file_path: file_path.to_path_buf(),
+                key: key.to_string(),
+                reason: format!("Failed to open file for part {}: {}", part_number, e),
+                details: None,
+            });
+        }
+    };
+
+    // Seek to the start position
+    if let Err(e) = tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(start)).await {
+        return Err(UploadError {
+            file_path: file_path.to_path_buf(),
+            key: key.to_string(),
+            reason: format!("Failed to seek in file for part {}: {}", part_number, e),
+            details: None,
+        });
+    }
+
+    // Read the part data
+    let mut buffer = vec![0u8; part_size as usize];
+    if let Err(e) = file.read_exact(&mut buffer).await {
+        return Err(UploadError {
+            file_path: file_path.to_path_buf(),
+            key: key.to_string(),
+            reason: format!("Failed to read file for part {}: {}", part_number, e),
+            details: None,
+        });
+    }
+
+    let body = ByteStream::from(buffer);
+
+    // Upload the part
+    let upload_result = client
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(part_number)
+        .body(body)
+        .send()
+        .await;
+
+    match upload_result {
+        Ok(response) => {
+            let etag = response.e_tag().unwrap_or_default().to_string();
+            if verbose {
+                eprintln!("[verbose] Part {} completed, ETag: {}", part_number, etag);
+            }
+
+            let completed_part = CompletedPart::builder()
+                .part_number(part_number)
+                .e_tag(etag)
+                .build();
+
+            completed_parts.lock().await.push(completed_part);
+            Ok(())
+        }
+        Err(e) => {
+            let service_err = e.into_service_error();
+            Err(UploadError {
+                file_path: file_path.to_path_buf(),
+                key: key.to_string(),
+                reason: format!("Failed to upload part {}: {}", part_number, format_s3_error(&service_err)),
                 details: Some(format!("{:?}", service_err)),
             })
         }
