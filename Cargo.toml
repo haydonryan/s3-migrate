@@ -1,0 +1,14 @@
+[package]
+name = "s3-migrate"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+aws-sdk-s3 = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+futures = "0.3"
+indicatif = "0.17"
+walkdir = "2"
