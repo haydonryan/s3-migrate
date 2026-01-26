@@ -2,13 +2,13 @@ use anyhow::{Context, Result};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::types::CompletedMultipartUpload;
 use aws_sdk_s3::types::CompletedPart;
-use aws_sdk_s3::{config::Region, primitives::ByteStream, Client};
+use aws_sdk_s3::{Client, config::Region, primitives::ByteStream};
 use clap::{Parser, Subcommand};
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
@@ -132,7 +132,15 @@ async fn main() -> Result<()> {
             bucket,
             prefix,
         } => {
-            download(&client, &output, bucket.as_deref(), prefix.as_deref(), cli.concurrency, verbose).await?;
+            download(
+                &client,
+                &output,
+                bucket.as_deref(),
+                prefix.as_deref(),
+                cli.concurrency,
+                verbose,
+            )
+            .await?;
         }
         Commands::Upload {
             input,
@@ -153,19 +161,17 @@ async fn main() -> Result<()> {
 }
 
 async fn create_s3_client(cli: &Cli) -> Result<Client> {
-    let mut config_loader = aws_config::defaults(BehaviorVersion::latest())
-        .region(Region::new(cli.region.clone()));
+    let mut config_loader =
+        aws_config::defaults(BehaviorVersion::latest()).region(Region::new(cli.region.clone()));
 
     if let (Some(access_key), Some(secret_key)) = (&cli.access_key, &cli.secret_key) {
-        config_loader = config_loader.credentials_provider(
-            aws_sdk_s3::config::Credentials::new(
-                access_key,
-                secret_key,
-                None,
-                None,
-                "cli-credentials",
-            ),
-        );
+        config_loader = config_loader.credentials_provider(aws_sdk_s3::config::Credentials::new(
+            access_key,
+            secret_key,
+            None,
+            None,
+            "cli-credentials",
+        ));
     }
 
     let sdk_config = config_loader.load().await;
@@ -272,10 +278,16 @@ fn format_s3_error<E: std::fmt::Debug>(err: &E) -> String {
     } else if debug_str.contains("InvalidBucketName") {
         "Invalid bucket name".to_string()
     } else if debug_str.contains("connection") || debug_str.contains("Connection") {
-        format!("Connection error - check endpoint URL and network: {}", debug_str)
+        format!(
+            "Connection error - check endpoint URL and network: {}",
+            debug_str
+        )
     } else if debug_str.contains("timeout") || debug_str.contains("Timeout") {
         "Request timed out".to_string()
-    } else if debug_str.contains("dns") || debug_str.contains("DNS") || debug_str.contains("resolve") {
+    } else if debug_str.contains("dns")
+        || debug_str.contains("DNS")
+        || debug_str.contains("resolve")
+    {
         "DNS resolution failed - check endpoint URL".to_string()
     } else {
         debug_str
@@ -321,7 +333,11 @@ async fn download(
         }
 
         let total_size: u64 = objects.iter().map(|o| o.size).sum();
-        println!("  {} objects, total size: {}", objects.len(), format_bytes(total_size));
+        println!(
+            "  {} objects, total size: {}",
+            objects.len(),
+            format_bytes(total_size)
+        );
 
         let pb = ProgressBar::new(objects.len() as u64);
         pb.set_style(
@@ -342,7 +358,9 @@ async fn download(
                 let bytes_downloaded = bytes_downloaded.clone();
                 let error_count = error_count.clone();
                 async move {
-                    let result = download_object_streaming(&client, &bucket, &obj.key, &bucket_dir, verbose).await;
+                    let result =
+                        download_object_streaming(&client, &bucket, &obj.key, &bucket_dir, verbose)
+                            .await;
                     match &result {
                         Ok(_) => {
                             bytes_downloaded.fetch_add(obj.size, Ordering::Relaxed);
@@ -364,7 +382,10 @@ async fn download(
             .collect()
             .await;
 
-        pb.finish_with_message(format!("Done - Downloaded: {}", format_bytes(bytes_downloaded.load(Ordering::Relaxed))));
+        pb.finish_with_message(format!(
+            "Done - Downloaded: {}",
+            format_bytes(bytes_downloaded.load(Ordering::Relaxed))
+        ));
 
         let errors: Vec<_> = results.into_iter().filter_map(|r| r.err()).collect();
         if !errors.is_empty() {
@@ -434,7 +455,12 @@ async fn download_object_streaming(
     let file_path = output_dir.join(key);
 
     if verbose {
-        eprintln!("[verbose] Downloading: {}/{} -> {}", bucket, key, file_path.display());
+        eprintln!(
+            "[verbose] Downloading: {}/{} -> {}",
+            bucket,
+            key,
+            file_path.display()
+        );
     }
 
     if let Some(parent) = file_path.parent() {
@@ -449,7 +475,8 @@ async fn download_object_streaming(
         .await
         .with_context(|| format!("Failed to download {}/{}", bucket, key))?;
 
-    let mut file = fs::File::create(&file_path).await
+    let mut file = fs::File::create(&file_path)
+        .await
         .with_context(|| format!("Failed to create file: {}", file_path.display()))?;
 
     // Stream the body to file in chunks instead of loading entire file into memory
@@ -457,14 +484,16 @@ async fn download_object_streaming(
     let mut buffer = vec![0u8; 8 * 1024 * 1024]; // 8MB buffer
 
     loop {
-        let bytes_read = tokio::io::AsyncReadExt::read(&mut stream, &mut buffer).await
+        let bytes_read = tokio::io::AsyncReadExt::read(&mut stream, &mut buffer)
+            .await
             .with_context(|| format!("Failed to read stream for {}/{}", bucket, key))?;
 
         if bytes_read == 0 {
             break;
         }
 
-        file.write_all(&buffer[..bytes_read]).await
+        file.write_all(&buffer[..bytes_read])
+            .await
             .with_context(|| format!("Failed to write to file: {}", file_path.display()))?;
     }
 
@@ -495,7 +524,10 @@ async fn upload(
 
     // Verify bucket exists and we have access
     if verbose {
-        eprintln!("[verbose] Checking bucket '{}' exists and is accessible...", bucket);
+        eprintln!(
+            "[verbose] Checking bucket '{}' exists and is accessible...",
+            bucket
+        );
     }
     match client.head_bucket().bucket(bucket).send().await {
         Ok(_) => {
@@ -549,7 +581,10 @@ async fn upload(
     }
 
     if !inaccessible_files.is_empty() {
-        eprintln!("Warning: {} file(s) cannot be read:", inaccessible_files.len());
+        eprintln!(
+            "Warning: {} file(s) cannot be read:",
+            inaccessible_files.len()
+        );
         for (path, reason) in inaccessible_files.iter().take(5) {
             eprintln!("  - {}: {}", path.display(), reason);
         }
@@ -558,7 +593,12 @@ async fn upload(
         }
     }
 
-    println!("Uploading {} file(s) ({}) to bucket '{}'", files.len(), format_bytes(total_size), bucket);
+    println!(
+        "Uploading {} file(s) ({}) to bucket '{}'",
+        files.len(),
+        format_bytes(total_size),
+        bucket
+    );
 
     let pb = ProgressBar::new(files.len() as u64);
     pb.set_style(
@@ -585,7 +625,8 @@ async fn upload(
             let bytes_uploaded = bytes_uploaded.clone();
             async move {
                 let file_size = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
-                let result = upload_file(&client, &file_path, &bucket, &prefix, &base_path, verbose).await;
+                let result =
+                    upload_file(&client, &file_path, &bucket, &prefix, &base_path, verbose).await;
                 match &result {
                     Ok(_) => {
                         bytes_uploaded.fetch_add(file_size, Ordering::Relaxed);
@@ -602,7 +643,10 @@ async fn upload(
         .collect()
         .await;
 
-    pb.finish_with_message(format!("Done - Uploaded: {}", format_bytes(bytes_uploaded.load(Ordering::Relaxed))));
+    pb.finish_with_message(format!(
+        "Done - Uploaded: {}",
+        format_bytes(bytes_uploaded.load(Ordering::Relaxed))
+    ));
 
     let errors: Vec<_> = results.into_iter().filter_map(|r| r.err()).collect();
     if !errors.is_empty() {
@@ -634,9 +678,7 @@ async fn upload_file(
     base_path: &Path,
     verbose: bool,
 ) -> Result<(), UploadError> {
-    let relative_path = file_path
-        .strip_prefix(base_path)
-        .unwrap_or(file_path);
+    let relative_path = file_path.strip_prefix(base_path).unwrap_or(file_path);
 
     let key = if prefix.is_empty() {
         relative_path.to_string_lossy().to_string()
@@ -651,7 +693,12 @@ async fn upload_file(
     let key = key.replace('\\', "/");
 
     if verbose {
-        eprintln!("[verbose] Uploading: {} -> {}/{}", file_path.display(), bucket, key);
+        eprintln!(
+            "[verbose] Uploading: {} -> {}/{}",
+            file_path.display(),
+            bucket,
+            key
+        );
     }
 
     // Check file size
@@ -668,13 +715,20 @@ async fn upload_file(
     };
 
     if verbose {
-        eprintln!("[verbose] File size: {} ({})", file_size, format_bytes(file_size));
+        eprintln!(
+            "[verbose] File size: {} ({})",
+            file_size,
+            format_bytes(file_size)
+        );
     }
 
     // Use multipart upload for large files
     if file_size > MULTIPART_THRESHOLD {
         if verbose {
-            eprintln!("[verbose] Using multipart upload for large file ({})", format_bytes(file_size));
+            eprintln!(
+                "[verbose] Using multipart upload for large file ({})",
+                format_bytes(file_size)
+            );
         }
         return upload_multipart(client, file_path, bucket, &key, file_size, verbose).await;
     }
@@ -741,7 +795,10 @@ async fn upload_multipart(
             return Err(UploadError {
                 file_path: file_path.to_path_buf(),
                 key: key.to_string(),
-                reason: format!("Failed to create multipart upload: {}", format_s3_error(&service_err)),
+                reason: format!(
+                    "Failed to create multipart upload: {}",
+                    format_s3_error(&service_err)
+                ),
                 details: Some(format!("{:?}", service_err)),
             });
         }
@@ -761,7 +818,11 @@ async fn upload_multipart(
     // Calculate parts
     let num_parts = (file_size + MULTIPART_PART_SIZE - 1) / MULTIPART_PART_SIZE;
     if verbose {
-        eprintln!("[verbose] Uploading in {} parts of {} each", num_parts, format_bytes(MULTIPART_PART_SIZE));
+        eprintln!(
+            "[verbose] Uploading in {} parts of {} each",
+            num_parts,
+            format_bytes(MULTIPART_PART_SIZE)
+        );
     }
 
     // Upload parts
@@ -822,7 +883,13 @@ async fn upload_multipart(
             file_path: file_path.to_path_buf(),
             key: key.to_string(),
             reason: format!("Multipart upload failed: {} part(s) failed", errors.len()),
-            details: Some(errors.iter().map(|e| e.reason.clone()).collect::<Vec<_>>().join("; ")),
+            details: Some(
+                errors
+                    .iter()
+                    .map(|e| e.reason.clone())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
         });
     }
 
@@ -854,7 +921,10 @@ async fn upload_multipart(
             Err(UploadError {
                 file_path: file_path.to_path_buf(),
                 key: key.to_string(),
-                reason: format!("Failed to complete multipart upload: {}", format_s3_error(&service_err)),
+                reason: format!(
+                    "Failed to complete multipart upload: {}",
+                    format_s3_error(&service_err)
+                ),
                 details: Some(format!("{:?}", service_err)),
             })
         }
@@ -896,7 +966,8 @@ async fn upload_part(
     };
 
     // Seek to the start position
-    if let Err(e) = tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(start)).await {
+    if let Err(e) = tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(start)).await
+    {
         return Err(UploadError {
             file_path: file_path.to_path_buf(),
             key: key.to_string(),
@@ -949,7 +1020,11 @@ async fn upload_part(
             Err(UploadError {
                 file_path: file_path.to_path_buf(),
                 key: key.to_string(),
-                reason: format!("Failed to upload part {}: {}", part_number, format_s3_error(&service_err)),
+                reason: format!(
+                    "Failed to upload part {}: {}",
+                    part_number,
+                    format_s3_error(&service_err)
+                ),
                 details: Some(format!("{:?}", service_err)),
             })
         }
