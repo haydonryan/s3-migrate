@@ -339,10 +339,10 @@ async fn download(
             format_bytes(total_size)
         );
 
-        let pb = ProgressBar::new(objects.len() as u64);
+        let pb = ProgressBar::new(total_size);
         pb.set_style(
             ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")?
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {msg}")?
                 .progress_chars("#>-"),
         );
 
@@ -358,23 +358,23 @@ async fn download(
                 let bytes_downloaded = bytes_downloaded.clone();
                 let error_count = error_count.clone();
                 async move {
-                    let result =
-                        download_object_streaming(&client, &bucket, &obj.key, &bucket_dir, verbose)
-                            .await;
-                    match &result {
-                        Ok(_) => {
-                            bytes_downloaded.fetch_add(obj.size, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            error_count.fetch_add(1, Ordering::Relaxed);
-                            if verbose {
-                                eprintln!("[verbose] Error downloading {}: {}", obj.key, e);
-                            }
+                    let result = download_object_streaming(
+                        &client,
+                        &bucket,
+                        &obj.key,
+                        &bucket_dir,
+                        verbose,
+                        bytes_downloaded.clone(),
+                        total_size,
+                        pb.clone(),
+                    )
+                    .await;
+                    if let Err(ref e) = result {
+                        error_count.fetch_add(1, Ordering::Relaxed);
+                        if verbose {
+                            eprintln!("[verbose] Error downloading {}: {}", obj.key, e);
                         }
                     }
-                    pb.inc(1);
-                    let downloaded = bytes_downloaded.load(Ordering::Relaxed);
-                    pb.set_message(format!("Downloaded: {}", format_bytes(downloaded)));
                     result
                 }
             })
@@ -383,8 +383,9 @@ async fn download(
             .await;
 
         pb.finish_with_message(format!(
-            "Done - Downloaded: {}",
-            format_bytes(bytes_downloaded.load(Ordering::Relaxed))
+            "{} / {} (complete)",
+            format_bytes(bytes_downloaded.load(Ordering::Relaxed)),
+            format_bytes(total_size)
         ));
 
         let errors: Vec<_> = results.into_iter().filter_map(|r| r.err()).collect();
@@ -451,6 +452,9 @@ async fn download_object_streaming(
     key: &str,
     output_dir: &Path,
     verbose: bool,
+    bytes_downloaded: Arc<AtomicU64>,
+    total_size: u64,
+    pb: ProgressBar,
 ) -> Result<()> {
     let file_path = output_dir.join(key);
 
@@ -495,6 +499,16 @@ async fn download_object_streaming(
         file.write_all(&buffer[..bytes_read])
             .await
             .with_context(|| format!("Failed to write to file: {}", file_path.display()))?;
+
+        // Update progress after each chunk
+        let downloaded =
+            bytes_downloaded.fetch_add(bytes_read as u64, Ordering::Relaxed) + bytes_read as u64;
+        pb.set_position(downloaded);
+        pb.set_message(format!(
+            "{} / {}",
+            format_bytes(downloaded),
+            format_bytes(total_size)
+        ));
     }
 
     file.flush().await?;
@@ -600,10 +614,10 @@ async fn upload(
         bucket
     );
 
-    let pb = ProgressBar::new(files.len() as u64);
+    let pb = ProgressBar::new(total_size);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")?
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {msg}")?
             .progress_chars("#>-"),
     );
 
@@ -624,18 +638,18 @@ async fn upload(
             let pb = pb.clone();
             let bytes_uploaded = bytes_uploaded.clone();
             async move {
-                let file_size = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
-                let result =
-                    upload_file(&client, &file_path, &bucket, &prefix, &base_path, verbose).await;
-                match &result {
-                    Ok(_) => {
-                        bytes_uploaded.fetch_add(file_size, Ordering::Relaxed);
-                    }
-                    Err(_) => {}
-                }
-                pb.inc(1);
-                let uploaded = bytes_uploaded.load(Ordering::Relaxed);
-                pb.set_message(format!("Uploaded: {}", format_bytes(uploaded)));
+                let result = upload_file(
+                    &client,
+                    &file_path,
+                    &bucket,
+                    &prefix,
+                    &base_path,
+                    verbose,
+                    bytes_uploaded.clone(),
+                    total_size,
+                    pb.clone(),
+                )
+                .await;
                 result
             }
         })
@@ -644,8 +658,9 @@ async fn upload(
         .await;
 
     pb.finish_with_message(format!(
-        "Done - Uploaded: {}",
-        format_bytes(bytes_uploaded.load(Ordering::Relaxed))
+        "{} / {} (complete)",
+        format_bytes(bytes_uploaded.load(Ordering::Relaxed)),
+        format_bytes(total_size)
     ));
 
     let errors: Vec<_> = results.into_iter().filter_map(|r| r.err()).collect();
@@ -677,6 +692,9 @@ async fn upload_file(
     prefix: &str,
     base_path: &Path,
     verbose: bool,
+    bytes_uploaded: Arc<AtomicU64>,
+    total_size: u64,
+    pb: ProgressBar,
 ) -> Result<(), UploadError> {
     let relative_path = file_path.strip_prefix(base_path).unwrap_or(file_path);
 
@@ -730,7 +748,18 @@ async fn upload_file(
                 format_bytes(file_size)
             );
         }
-        return upload_multipart(client, file_path, bucket, &key, file_size, verbose).await;
+        return upload_multipart(
+            client,
+            file_path,
+            bucket,
+            &key,
+            file_size,
+            verbose,
+            bytes_uploaded,
+            total_size,
+            pb,
+        )
+        .await;
     }
 
     // Single part upload for smaller files
@@ -755,6 +784,14 @@ async fn upload_file(
         .await
     {
         Ok(_) => {
+            // Update progress after successful upload
+            let uploaded = bytes_uploaded.fetch_add(file_size, Ordering::Relaxed) + file_size;
+            pb.set_position(uploaded);
+            pb.set_message(format!(
+                "{} / {}",
+                format_bytes(uploaded),
+                format_bytes(total_size)
+            ));
             if verbose {
                 eprintln!("[verbose] Completed: {}", key);
             }
@@ -780,6 +817,9 @@ async fn upload_multipart(
     key: &str,
     file_size: u64,
     verbose: bool,
+    bytes_uploaded: Arc<AtomicU64>,
+    total_size: u64,
+    pb: ProgressBar,
 ) -> Result<(), UploadError> {
     // Create multipart upload
     let create_response = match client
@@ -840,6 +880,8 @@ async fn upload_multipart(
         let upload_id = upload_id.to_string();
         let file_path = file_path.to_path_buf();
         let completed_parts = completed_parts.clone();
+        let bytes_uploaded = bytes_uploaded.clone();
+        let pb = pb.clone();
 
         part_uploads.push(async move {
             upload_part(
@@ -853,6 +895,9 @@ async fn upload_multipart(
                 part_size,
                 completed_parts,
                 verbose,
+                bytes_uploaded,
+                total_size,
+                pb,
             )
             .await
         });
@@ -942,6 +987,9 @@ async fn upload_part(
     part_size: u64,
     completed_parts: Arc<Mutex<Vec<CompletedPart>>>,
     verbose: bool,
+    bytes_uploaded: Arc<AtomicU64>,
+    total_size: u64,
+    pb: ProgressBar,
 ) -> Result<(), UploadError> {
     if verbose {
         eprintln!(
@@ -1006,6 +1054,15 @@ async fn upload_part(
             if verbose {
                 eprintln!("[verbose] Part {} completed, ETag: {}", part_number, etag);
             }
+
+            // Update progress after each part
+            let uploaded = bytes_uploaded.fetch_add(part_size, Ordering::Relaxed) + part_size;
+            pb.set_position(uploaded);
+            pb.set_message(format!(
+                "{} / {}",
+                format_bytes(uploaded),
+                format_bytes(total_size)
+            ));
 
             let completed_part = CompletedPart::builder()
                 .part_number(part_number)
