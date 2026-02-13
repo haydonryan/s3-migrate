@@ -16,7 +16,8 @@ use walkdir::WalkDir;
 
 // Multipart upload thresholds
 const MULTIPART_THRESHOLD: u64 = 5 * 1024 * 1024 * 1024; // 5GB - use multipart for files larger than this
-const MULTIPART_PART_SIZE: u64 = 16 * 1024 * 1024; // 16MiB per part
+const MULTIPART_PART_SIZE: u64 = 16 * 1000 * 1000; // 16MiB per part
+// const MULTIPART_PART_SIZE: u64 = 16 * 1024 * 1024; // 16MiB per part
 
 #[derive(Parser)]
 #[command(name = "s3-migrate")]
