@@ -1,5 +1,7 @@
 # s3-migrate
 
+(warning unmaintained - use the rustfs cli instead https://github.com/rustfs/cli)
+
 A command-line tool for migrating data to and from S3-compatible storage.
 
 ## Features
